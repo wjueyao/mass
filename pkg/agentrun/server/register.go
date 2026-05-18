@@ -45,8 +45,10 @@ type Handler interface {
 func Register(s *jsonrpc.Server, svc Handler) {
 	s.RegisterService("session", &jsonrpc.ServiceDesc{
 		Methods: map[string]jsonrpc.Method{
-			"prompt":    jsonrpc.UnaryMethod(svc.Prompt),
-			"cancel":    jsonrpc.UnaryCommand(svc.Cancel),
+			"prompt": jsonrpc.UnaryMethod(svc.Prompt),
+			// cancel tolerates absent params (back-compat for callers that
+			// omit the field — pre-multi-session wire shape).
+			"cancel":    jsonrpc.OptionalUnaryCommand(svc.Cancel),
 			"load":      jsonrpc.UnaryCommand(svc.Load),
 			"set_model": jsonrpc.UnaryMethod(svc.SetModel),
 			"new":       jsonrpc.UnaryMethod(svc.NewSession),
