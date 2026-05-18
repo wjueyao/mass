@@ -57,19 +57,51 @@ type StateChange struct {
 type StateChangeHook func(StateChange)
 
 // Manager manages the lifecycle of a single ACP agent process.
+// sessionState holds per-session protocol metadata. Multiple sessions may
+// co-exist on one agent process — ACP's session/new is multi-session by
+// design (each session has its own cwd, sessionId, model state). The
+// agent process (e.g. claude-agent-acp) keeps sessions in a map keyed by
+// sessionId; this struct mirrors the runtime-side view of each.
+//
+// Multi-session lets callers (mass daemon / mindpowers) keep a long-lived
+// agent process and switch session per task, instead of fork+kill an
+// agent process per task. See docs/design/multi-session-per-agentrun.md
+// (TODO: add design doc) for the broader rationale.
+type sessionState struct {
+	id     acp.SessionId
+	models *acp.SessionModelState
+	cwd    string
+}
+
 type Manager struct {
 	cfg       apiruntime.Config
 	bundleDir string
 	stateDir  string
 	logger    *slog.Logger
 
-	mu              sync.Mutex
-	cmd             *exec.Cmd
-	processDone     chan struct{}
-	conn            *acp.ClientSideConnection
-	sessionID       acp.SessionId
-	events          chan acp.SessionNotification
-	models          *acp.SessionModelState // from session/new response
+	mu          sync.Mutex
+	cmd         *exec.Cmd
+	processDone chan struct{}
+	conn        *acp.ClientSideConnection
+	events      chan acp.SessionNotification
+
+	// sessions holds all active ACP sessions on this agent process, keyed
+	// by sessionId. NewSession adds entries; EndSession removes them.
+	// Empty until Create()'s initial session/new completes.
+	sessions map[acp.SessionId]*sessionState
+
+	// sessionID retains the *first* session created by Create() so legacy
+	// callers of Prompt/Cancel/SetModel (which don't pass sessionId) keep
+	// working without code changes. New callers should use the explicit
+	// sessionId-taking variants (PromptSession etc.). To be removed once
+	// all callers migrate.
+	sessionID acp.SessionId
+
+	// models tracks the *first* session's models for the same backward-
+	// compat reason as sessionID above. Per-session models live in
+	// sessions[id].models.
+	models *acp.SessionModelState
+
 	stateChangeHook StateChangeHook
 	eventCountsFn   func() map[string]int
 	usageFn         func() *apiruntime.UsageInfo
@@ -83,6 +115,7 @@ func New(cfg apiruntime.Config, bundleDir, stateDir string, logger *slog.Logger)
 		stateDir:  stateDir,
 		logger:    logger.With("subsystem", "runtime"),
 		events:    make(chan acp.SessionNotification, 1024),
+		sessions:  make(map[acp.SessionId]*sessionState),
 	}
 }
 
@@ -197,8 +230,17 @@ func (m *Manager) Create(ctx context.Context) error {
 		return fmt.Errorf("runtime: acp session/new: %w", err)
 	}
 	m.mu.Lock()
+	// Initial session populates both the legacy single-session fields
+	// (sessionID/models) and the multi-session map. Future sessions opened
+	// via NewSession only register in the map; sessionID stays pinned to
+	// the first one for backward compat with Prompt/Cancel/SetModel.
 	m.sessionID = sessionResp.SessionId
 	m.models = sessionResp.Models
+	m.sessions[sessionResp.SessionId] = &sessionState{
+		id:     sessionResp.SessionId,
+		models: sessionResp.Models,
+		cwd:    workDir,
+	}
 	m.mu.Unlock()
 	m.logger.Info("session created", "sessionID", sessionResp.SessionId)
 
@@ -303,6 +345,96 @@ func (m *Manager) Delete() error {
 // GetState returns the current persisted state of the agent.
 func (m *Manager) GetState() (apiruntime.State, error) {
 	return spec.ReadState(m.stateDir)
+}
+
+// NewSession opens an additional ACP session on the running agent process.
+// The agent must already be started via Create() (which creates the initial
+// session). Returns the new session's ID, which callers must pass to
+// PromptSession / CancelSession / EndSession to address this session.
+//
+// cwd overrides the agent's working directory for this session — useful for
+// running multiple isolated tasks on one long-lived agent (e.g. self-EDD's
+// per-case fixture directories). Empty cwd uses the agent's workDir.
+//
+// mcpServers (optional) are extra MCP servers scoped to this session, layered
+// on top of the agent's bundle-level mcpServers.
+func (m *Manager) NewSession(ctx context.Context, cwd string, mcpServers []acp.McpServer) (acp.SessionId, error) {
+	m.mu.Lock()
+	conn := m.conn
+	m.mu.Unlock()
+
+	if conn == nil {
+		return "", fmt.Errorf("runtime: agent not started")
+	}
+
+	resolvedCwd := cwd
+	if resolvedCwd == "" {
+		workDir, err := spec.ResolveAgentRoot(m.bundleDir, m.cfg)
+		if err != nil {
+			return "", fmt.Errorf("runtime: resolve cwd for new session: %w", err)
+		}
+		resolvedCwd = workDir
+	}
+
+	// Layer session-scoped mcpServers on top of bundle-level config. Callers
+	// that pass nil/empty get the bundle defaults.
+	merged := convertMcpServers(m.cfg.Session.McpServers)
+	merged = append(merged, mcpServers...)
+
+	req := acp.NewSessionRequest{
+		Meta:       m.cfg.Session.Meta,
+		Cwd:        resolvedCwd,
+		McpServers: merged,
+	}
+	resp, err := conn.NewSession(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("runtime: acp session/new: %w", err)
+	}
+
+	m.mu.Lock()
+	m.sessions[resp.SessionId] = &sessionState{
+		id:     resp.SessionId,
+		models: resp.Models,
+		cwd:    resolvedCwd,
+	}
+	m.mu.Unlock()
+	m.logger.Info("session opened", "sessionID", resp.SessionId, "cwd", resolvedCwd)
+	return resp.SessionId, nil
+}
+
+// EndSession releases runtime tracking of a session id. The ACP protocol
+// has no explicit "end session" RPC today, so this method only clears the
+// runtime's local map entry — the agent process retains its own session
+// state until cancelled or the process exits. Callers must still call
+// CancelSession (or wait for prompt completion) before EndSession to ensure
+// no in-flight work on the session.
+//
+// Refusing to end the initial session (the one Create() opened) — callers
+// that want to fully tear down the agent should call Kill() instead.
+func (m *Manager) EndSession(sessionID acp.SessionId) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sessionID == m.sessionID {
+		return fmt.Errorf("runtime: cannot end initial session %q (kill the agent instead)", sessionID)
+	}
+	if _, ok := m.sessions[sessionID]; !ok {
+		return fmt.Errorf("runtime: session %q not found", sessionID)
+	}
+	delete(m.sessions, sessionID)
+	m.logger.Info("session ended", "sessionID", sessionID)
+	return nil
+}
+
+// Sessions returns a snapshot of currently-active session IDs. Order is
+// not stable — caller should sort if a deterministic order is needed.
+func (m *Manager) Sessions() []acp.SessionId {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := make([]acp.SessionId, 0, len(m.sessions))
+	for id := range m.sessions {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // Prompt sends a user prompt to the agent and blocks until the agent
