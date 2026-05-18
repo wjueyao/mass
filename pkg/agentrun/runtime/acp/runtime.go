@@ -437,20 +437,42 @@ func (m *Manager) Sessions() []acp.SessionId {
 	return ids
 }
 
-// Prompt sends a user prompt to the agent and blocks until the agent
-// returns a PromptResponse. Session notifications emitted by the agent
-// during the turn are forwarded to the Events channel.
-// On completion (success or error), LastTurn is persisted to state.json.
+// Prompt sends a user prompt to the agent's initial session and blocks
+// until the agent returns a PromptResponse. Session notifications emitted
+// by the agent during the turn are forwarded to the Events channel.
+// On completion (success or error), state.json is updated.
+//
+// This is a backward-compat shim around PromptSession that uses the
+// initial sessionId set by Create(). New callers should prefer
+// PromptSession with an explicit sessionId — especially when the agent
+// holds multiple sessions opened via NewSession.
 func (m *Manager) Prompt(ctx context.Context, prompt []acp.ContentBlock) (acp.PromptResponse, error) {
 	m.mu.Lock()
-	conn := m.conn
 	sessionID := m.sessionID
+	m.mu.Unlock()
+	return m.PromptSession(ctx, sessionID, prompt)
+}
+
+// PromptSession sends a user prompt to a specific session. See Prompt for
+// the general contract; the difference is the explicit sessionId.
+//
+// The state.json Phase field is single-valued today, so the
+// "PhaseRunning" stamp applies process-wide — when multiple sessions are
+// in-flight concurrently, phase is "running" if any session is. Per-
+// session phase tracking is a follow-up state-schema change.
+func (m *Manager) PromptSession(ctx context.Context, sessionID acp.SessionId, prompt []acp.ContentBlock) (acp.PromptResponse, error) {
+	m.mu.Lock()
+	conn := m.conn
+	_, known := m.sessions[sessionID]
 	m.mu.Unlock()
 
 	if conn == nil {
 		return acp.PromptResponse{}, fmt.Errorf("runtime: agent not started")
 	}
-	m.logger.Debug("prompt started", "blocks", len(prompt))
+	if !known {
+		return acp.PromptResponse{}, fmt.Errorf("runtime: prompt: session %q not found", sessionID)
+	}
+	m.logger.Debug("prompt started", "sessionID", sessionID, "blocks", len(prompt))
 
 	_ = m.writeState(func(s *apiruntime.State) {
 		s.Phase = apiruntime.PhaseRunning
@@ -466,7 +488,7 @@ func (m *Manager) Prompt(ctx context.Context, prompt []acp.ContentBlock) (acp.Pr
 		if err != nil {
 			reason = "prompt-failed"
 		}
-		m.logger.Debug("prompt done", "reason", reason)
+		m.logger.Debug("prompt done", "sessionID", sessionID, "reason", reason)
 		_ = m.writeState(func(s *apiruntime.State) {
 			s.Phase = apiruntime.PhaseIdle
 		}, reason)
@@ -478,17 +500,29 @@ func (m *Manager) Prompt(ctx context.Context, prompt []acp.ContentBlock) (acp.Pr
 	return resp, nil
 }
 
-// Cancel sends a cancel notification to the agent for the current session.
+// Cancel sends a cancel notification to the agent for the initial session.
+// Backward-compat shim around CancelSession.
 func (m *Manager) Cancel(ctx context.Context) error {
 	m.mu.Lock()
-	conn := m.conn
 	sessionID := m.sessionID
+	m.mu.Unlock()
+	return m.CancelSession(ctx, sessionID)
+}
+
+// CancelSession sends a cancel notification for a specific session.
+func (m *Manager) CancelSession(ctx context.Context, sessionID acp.SessionId) error {
+	m.mu.Lock()
+	conn := m.conn
+	_, known := m.sessions[sessionID]
 	m.mu.Unlock()
 
 	if conn == nil {
 		return fmt.Errorf("runtime: agent not started")
 	}
-	m.logger.Debug("cancel")
+	if !known {
+		return fmt.Errorf("runtime: cancel: session %q not found", sessionID)
+	}
+	m.logger.Debug("cancel", "sessionID", sessionID)
 
 	if err := conn.Cancel(ctx, acp.CancelNotification{SessionId: sessionID}); err != nil {
 		return fmt.Errorf("runtime: cancel: %w", err)
@@ -496,17 +530,34 @@ func (m *Manager) Cancel(ctx context.Context) error {
 	return nil
 }
 
-// SetModel switches the agent to a different model via ACP session/set_model.
+// SetModel switches the initial session to a different model.
+// Backward-compat shim around SetModelSession.
 func (m *Manager) SetModel(ctx context.Context, modelID string) error {
 	m.mu.Lock()
-	conn := m.conn
 	sessionID := m.sessionID
+	m.mu.Unlock()
+	return m.SetModelSession(ctx, sessionID, modelID)
+}
+
+// SetModelSession switches a specific session to a different model via
+// ACP session/set_model. Updates in-memory per-session models state +
+// (only for the initial session) the legacy state.json Session.Models
+// field. Per-session models persistence is a follow-up state-schema
+// change.
+func (m *Manager) SetModelSession(ctx context.Context, sessionID acp.SessionId, modelID string) error {
+	m.mu.Lock()
+	conn := m.conn
+	sess, known := m.sessions[sessionID]
+	initialID := m.sessionID
 	m.mu.Unlock()
 
 	if conn == nil {
 		return fmt.Errorf("runtime: agent not started")
 	}
-	m.logger.Debug("set_model", "modelID", modelID)
+	if !known {
+		return fmt.Errorf("runtime: set_model: session %q not found", sessionID)
+	}
+	m.logger.Debug("set_model", "sessionID", sessionID, "modelID", modelID)
 
 	_, err := conn.UnstableSetSessionModel(ctx, acp.UnstableSetSessionModelRequest{
 		SessionId: sessionID,
@@ -516,19 +567,27 @@ func (m *Manager) SetModel(ctx context.Context, modelID string) error {
 		return fmt.Errorf("runtime: set model: %w", err)
 	}
 
-	// Update in-memory models state.
+	// Update per-session in-memory models state.
 	m.mu.Lock()
-	if m.models != nil {
+	if sess.models != nil {
+		sess.models.CurrentModelId = acp.ModelId(modelID) //nolint:gosec // ModelId is string
+	}
+	// Legacy single-session models mirror for the initial session only.
+	if sessionID == initialID && m.models != nil {
 		m.models.CurrentModelId = acp.ModelId(modelID) //nolint:gosec // ModelId is string
 	}
 	m.mu.Unlock()
 
-	// Persist updated currentModelId to state.json.
-	_ = m.writeState(func(s *apiruntime.State) {
-		if s.Session != nil && s.Session.Models != nil {
-			s.Session.Models.CurrentModelId = modelID
-		}
-	}, "set-model")
+	// state.json's Session.Models is single-session; only update for the
+	// initial session to keep legacy semantics. Multi-session persistence
+	// is a follow-up.
+	if sessionID == initialID {
+		_ = m.writeState(func(s *apiruntime.State) {
+			if s.Session != nil && s.Session.Models != nil {
+				s.Session.Models.CurrentModelId = modelID
+			}
+		}, "set-model")
+	}
 
 	return nil
 }
