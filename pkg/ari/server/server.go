@@ -516,15 +516,78 @@ func (a *agentRunAdapter) Prompt(ctx context.Context, req *pkgariapi.AgentRunPro
 	}
 
 	prompt := req.Prompt
-	if err := client.SendPrompt(ctx, &runapi.SessionPromptParams{Prompt: prompt}); err != nil {
+	if err := client.SendPrompt(ctx, &runapi.SessionPromptParams{
+		SessionID: req.SessionID,
+		Prompt:    prompt,
+	}); err != nil {
 		a.logger.Warn("agentrun/prompt: prompt delivery failed",
 			"workspace", req.Workspace, "name", req.Name, "error", err)
 		a.recordPromptDeliveryFailure(req.Workspace, req.Name, agent.Status, err, false)
 	}
 
 	a.logger.Info("agentrun/prompt: dispatched",
-		"workspace", req.Workspace, "name", req.Name)
+		"workspace", req.Workspace, "name", req.Name, "sessionId", req.SessionID)
 	return &pkgariapi.AgentRunPromptResult{Accepted: true}, nil
+}
+
+// NewSession forwards agentrun/new-session to the running agent-run's
+// session/new RPC. The agent reuses its process to host the new session
+// — no fork+exec. Returns the agent-issued sessionId.
+func (a *agentRunAdapter) NewSession(ctx context.Context, req *pkgariapi.AgentRunNewSessionParams) (*pkgariapi.AgentRunNewSessionResult, error) {
+	if req.Workspace == "" || req.Name == "" || req.Cwd == "" {
+		return nil, jsonrpc.ErrInvalidParams("workspace, name, and cwd are required")
+	}
+	a.logger.Info("agentrun/new-session", "workspace", req.Workspace, "name", req.Name, "cwd", req.Cwd)
+
+	client, err := a.processes.Connect(ctx, req.Workspace, req.Name)
+	if err != nil {
+		return nil, &jsonrpc.RPCError{Code: pkgariapi.CodeRecoveryBlocked, Message: "agent not running"}
+	}
+
+	out, err := client.NewSession(ctx, &runapi.SessionNewParams{
+		Cwd:        req.Cwd,
+		McpServers: req.McpServers,
+	})
+	if err != nil {
+		return nil, jsonrpc.ErrInternal(err.Error())
+	}
+	a.logger.Info("agentrun/new-session: opened",
+		"workspace", req.Workspace, "name", req.Name, "sessionId", out.SessionID)
+	return &pkgariapi.AgentRunNewSessionResult{SessionID: out.SessionID}, nil
+}
+
+// EndSession forwards agentrun/end-session to release runtime tracking.
+func (a *agentRunAdapter) EndSession(ctx context.Context, req *pkgariapi.AgentRunEndSessionParams) (*pkgariapi.AgentRunEndSessionResult, error) {
+	if req.Workspace == "" || req.Name == "" || req.SessionID == "" {
+		return nil, jsonrpc.ErrInvalidParams("workspace, name, and sessionId are required")
+	}
+	a.logger.Info("agentrun/end-session", "workspace", req.Workspace, "name", req.Name, "sessionId", req.SessionID)
+
+	client, err := a.processes.Connect(ctx, req.Workspace, req.Name)
+	if err != nil {
+		return nil, &jsonrpc.RPCError{Code: pkgariapi.CodeRecoveryBlocked, Message: "agent not running"}
+	}
+	if err := client.EndSession(ctx, req.SessionID); err != nil {
+		return nil, jsonrpc.ErrInternal(err.Error())
+	}
+	return &pkgariapi.AgentRunEndSessionResult{}, nil
+}
+
+// ListSessions forwards agentrun/list-sessions to enumerate active sessions.
+func (a *agentRunAdapter) ListSessions(ctx context.Context, req *pkgariapi.AgentRunListSessionsParams) (*pkgariapi.AgentRunListSessionsResult, error) {
+	if req.Workspace == "" || req.Name == "" {
+		return nil, jsonrpc.ErrInvalidParams("workspace and name are required")
+	}
+
+	client, err := a.processes.Connect(ctx, req.Workspace, req.Name)
+	if err != nil {
+		return nil, &jsonrpc.RPCError{Code: pkgariapi.CodeRecoveryBlocked, Message: "agent not running"}
+	}
+	out, err := client.ListSessions(ctx)
+	if err != nil {
+		return nil, jsonrpc.ErrInternal(err.Error())
+	}
+	return &pkgariapi.AgentRunListSessionsResult{SessionIDs: out.SessionIDs}, nil
 }
 
 // Cancel handles agentrun/cancel.

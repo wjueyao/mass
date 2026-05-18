@@ -28,6 +28,15 @@ const (
 	MethodAgentRunTaskGet   = "agentrun/task/get"
 	MethodAgentRunTaskList  = "agentrun/task/list"
 	MethodAgentRunTaskRetry = "agentrun/task/retry"
+
+	// Multi-session lifecycle for a single agentrun. session/new opens
+	// an additional ACP session (different cwd, fresh state) without
+	// fork+exec a new agent process; session/end releases runtime
+	// tracking; session/list enumerates active sessions. See
+	// pkg/agentrun/runtime/acp Manager.NewSession for runtime contract.
+	MethodAgentRunNewSession   = "agentrun/new-session"
+	MethodAgentRunEndSession   = "agentrun/end-session"
+	MethodAgentRunListSessions = "agentrun/list-sessions"
 )
 
 // ARI agent definition methods.

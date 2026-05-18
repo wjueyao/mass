@@ -36,6 +36,11 @@ type AgentRunService interface {
 	TaskGet(ctx context.Context, params *pkgariapi.AgentRunTaskGetParams) (*pkgariapi.AgentTask, error)
 	TaskList(ctx context.Context, params *pkgariapi.AgentRunTaskListParams) (*pkgariapi.AgentRunTaskListResult, error)
 	TaskRetry(ctx context.Context, params *pkgariapi.AgentRunTaskRetryParams) (*pkgariapi.AgentTask, error)
+
+	// Multi-session lifecycle.
+	NewSession(ctx context.Context, req *pkgariapi.AgentRunNewSessionParams) (*pkgariapi.AgentRunNewSessionResult, error)
+	EndSession(ctx context.Context, req *pkgariapi.AgentRunEndSessionParams) (*pkgariapi.AgentRunEndSessionResult, error)
+	ListSessions(ctx context.Context, req *pkgariapi.AgentRunListSessionsParams) (*pkgariapi.AgentRunListSessionsResult, error)
 }
 
 // AgentService defines agent definition CRUD methods.
@@ -157,6 +162,11 @@ func RegisterAgentRunService(s *jsonrpc.Server, svc AgentRunService) {
 			"task/get":   jsonrpc.UnaryMethod(svc.TaskGet),
 			"task/list":  jsonrpc.UnaryMethod(svc.TaskList),
 			"task/retry": jsonrpc.UnaryMethod(svc.TaskRetry),
+			// Multi-session lifecycle (see pkg/agentrun/runtime/acp
+			// Manager.NewSession for runtime contract).
+			"new-session":   jsonrpc.UnaryMethod(svc.NewSession),
+			"end-session":   jsonrpc.UnaryMethod(svc.EndSession),
+			"list-sessions": jsonrpc.UnaryMethod(svc.ListSessions),
 		},
 	})
 }
