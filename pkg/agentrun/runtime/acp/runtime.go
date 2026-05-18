@@ -71,6 +71,9 @@ type sessionState struct {
 	id     acp.SessionId
 	models *acp.SessionModelState
 	cwd    string
+	// inflight counts active PromptSession turns. EndSession refuses to
+	// release a session with inflight > 0; the prompt's defer decrements it.
+	inflight int
 }
 
 type Manager struct {
@@ -87,7 +90,8 @@ type Manager struct {
 
 	// sessions holds all active ACP sessions on this agent process, keyed
 	// by sessionId. NewSession adds entries; EndSession removes them.
-	// Empty until Create()'s initial session/new completes.
+	// Empty until Create()'s initial session/new completes. Per-session
+	// inflight prompt count lives on each sessionState — see EndSession.
 	sessions map[acp.SessionId]*sessionState
 
 	// sessionID retains the *first* session created by Create() so legacy
@@ -405,11 +409,15 @@ func (m *Manager) NewSession(ctx context.Context, cwd string, mcpServers []acp.M
 // EndSession releases runtime tracking of a session id. The ACP protocol
 // has no explicit "end session" RPC today, so this method only clears the
 // runtime's local map entry — the agent process retains its own session
-// state until cancelled or the process exits. Callers must still call
-// CancelSession (or wait for prompt completion) before EndSession to ensure
-// no in-flight work on the session.
+// state until cancelled or the process exits.
 //
-// Refusing to end the initial session (the one Create() opened) — callers
+// EndSession refuses to release a session that has in-flight Prompt work
+// (returns ErrSessionBusy). Callers must CancelSession (or wait for prompt
+// completion) first; otherwise the prompt completes against a session no
+// longer tracked, and the resulting state.json Phase / log lines diverge
+// from the sessions map.
+//
+// Refuses to end the initial session (the one Create() opened) — callers
 // that want to fully tear down the agent should call Kill() instead.
 func (m *Manager) EndSession(sessionID acp.SessionId) error {
 	m.mu.Lock()
@@ -417,12 +425,25 @@ func (m *Manager) EndSession(sessionID acp.SessionId) error {
 	if sessionID == m.sessionID {
 		return fmt.Errorf("runtime: cannot end initial session %q (kill the agent instead)", sessionID)
 	}
-	if _, ok := m.sessions[sessionID]; !ok {
+	sess, ok := m.sessions[sessionID]
+	if !ok {
 		return fmt.Errorf("runtime: session %q not found", sessionID)
+	}
+	if sess.inflight > 0 {
+		return fmt.Errorf("runtime: session %q busy: %d in-flight prompt(s) (cancel first)", sessionID, sess.inflight)
 	}
 	delete(m.sessions, sessionID)
 	m.logger.Info("session ended", "sessionID", sessionID)
 	return nil
+}
+
+// resolveSessionLocked maps an empty sessionID to the initial session.
+// Caller must hold m.mu.
+func (m *Manager) resolveSessionLocked(sessionID acp.SessionId) acp.SessionId {
+	if sessionID == "" {
+		return m.sessionID
+	}
+	return sessionID
 }
 
 // Sessions returns a snapshot of currently-active session IDs. Order is
@@ -437,41 +458,50 @@ func (m *Manager) Sessions() []acp.SessionId {
 	return ids
 }
 
-// Prompt sends a user prompt to the agent's initial session and blocks
-// until the agent returns a PromptResponse. Session notifications emitted
-// by the agent during the turn are forwarded to the Events channel.
-// On completion (success or error), state.json is updated.
-//
-// This is a backward-compat shim around PromptSession that uses the
-// initial sessionId set by Create(). New callers should prefer
-// PromptSession with an explicit sessionId — especially when the agent
-// holds multiple sessions opened via NewSession.
+// Prompt is a backward-compat shim — equivalent to PromptSession(ctx, "", prompt),
+// which resolves empty SessionId to the initial session.
 func (m *Manager) Prompt(ctx context.Context, prompt []acp.ContentBlock) (acp.PromptResponse, error) {
-	m.mu.Lock()
-	sessionID := m.sessionID
-	m.mu.Unlock()
-	return m.PromptSession(ctx, sessionID, prompt)
+	return m.PromptSession(ctx, "", prompt)
 }
 
-// PromptSession sends a user prompt to a specific session. See Prompt for
-// the general contract; the difference is the explicit sessionId.
+// PromptSession sends a user prompt to a specific session and blocks until
+// the agent returns a PromptResponse. Empty sessionID is resolved to the
+// agent's initial session (the one Create() opened) — single resolution
+// point for the empty-string convention.
 //
-// The state.json Phase field is single-valued today, so the
-// "PhaseRunning" stamp applies process-wide — when multiple sessions are
-// in-flight concurrently, phase is "running" if any session is. Per-
-// session phase tracking is a follow-up state-schema change.
+// Session notifications emitted by the agent during the turn are forwarded
+// to the Events channel. On completion (success or error), state.json is
+// updated.
+//
+// The state.json Phase field is single-valued today, so the "PhaseRunning"
+// stamp applies process-wide — when multiple sessions are in-flight
+// concurrently, phase is "running" if any session is. Per-session phase
+// tracking is a follow-up state-schema change.
 func (m *Manager) PromptSession(ctx context.Context, sessionID acp.SessionId, prompt []acp.ContentBlock) (acp.PromptResponse, error) {
 	m.mu.Lock()
 	conn := m.conn
-	_, known := m.sessions[sessionID]
-	m.mu.Unlock()
-
+	sessionID = m.resolveSessionLocked(sessionID)
+	sess, known := m.sessions[sessionID]
 	if conn == nil {
+		m.mu.Unlock()
 		return acp.PromptResponse{}, fmt.Errorf("runtime: agent not started")
 	}
 	if !known {
+		m.mu.Unlock()
 		return acp.PromptResponse{}, fmt.Errorf("runtime: prompt: session %q not found", sessionID)
 	}
+	sess.inflight++
+	m.mu.Unlock()
+
+	defer func() {
+		m.mu.Lock()
+		// sess may have been deleted by Kill/Delete; guard the deref.
+		if s, ok := m.sessions[sessionID]; ok {
+			s.inflight--
+		}
+		m.mu.Unlock()
+	}()
+
 	m.logger.Debug("prompt started", "sessionID", sessionID, "blocks", len(prompt))
 
 	_ = m.writeState(func(s *apiruntime.State) {
@@ -500,19 +530,17 @@ func (m *Manager) PromptSession(ctx context.Context, sessionID acp.SessionId, pr
 	return resp, nil
 }
 
-// Cancel sends a cancel notification to the agent for the initial session.
-// Backward-compat shim around CancelSession.
+// Cancel is a backward-compat shim — equivalent to CancelSession(ctx, "").
 func (m *Manager) Cancel(ctx context.Context) error {
-	m.mu.Lock()
-	sessionID := m.sessionID
-	m.mu.Unlock()
-	return m.CancelSession(ctx, sessionID)
+	return m.CancelSession(ctx, "")
 }
 
-// CancelSession sends a cancel notification for a specific session.
+// CancelSession sends a cancel notification for a specific session. Empty
+// sessionID resolves to the initial session.
 func (m *Manager) CancelSession(ctx context.Context, sessionID acp.SessionId) error {
 	m.mu.Lock()
 	conn := m.conn
+	sessionID = m.resolveSessionLocked(sessionID)
 	_, known := m.sessions[sessionID]
 	m.mu.Unlock()
 
@@ -530,23 +558,20 @@ func (m *Manager) CancelSession(ctx context.Context, sessionID acp.SessionId) er
 	return nil
 }
 
-// SetModel switches the initial session to a different model.
-// Backward-compat shim around SetModelSession.
+// SetModel is a backward-compat shim — equivalent to SetModelSession(ctx, "", modelID).
 func (m *Manager) SetModel(ctx context.Context, modelID string) error {
-	m.mu.Lock()
-	sessionID := m.sessionID
-	m.mu.Unlock()
-	return m.SetModelSession(ctx, sessionID, modelID)
+	return m.SetModelSession(ctx, "", modelID)
 }
 
-// SetModelSession switches a specific session to a different model via
-// ACP session/set_model. Updates in-memory per-session models state +
-// (only for the initial session) the legacy state.json Session.Models
-// field. Per-session models persistence is a follow-up state-schema
-// change.
+// SetModelSession switches a specific session to a different model via ACP
+// session/set_model. Empty sessionID resolves to the initial session.
+// Updates in-memory per-session models state; for the initial session
+// also mirrors to the legacy state.json Session.Models field. Per-session
+// models persistence is a follow-up state-schema change.
 func (m *Manager) SetModelSession(ctx context.Context, sessionID acp.SessionId, modelID string) error {
 	m.mu.Lock()
 	conn := m.conn
+	sessionID = m.resolveSessionLocked(sessionID)
 	sess, known := m.sessions[sessionID]
 	initialID := m.sessionID
 	m.mu.Unlock()

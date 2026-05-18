@@ -12,9 +12,10 @@ import (
 )
 
 // resolveSessionID maps the wire-level optional sessionId string to the
-// typed acp.SessionId. Empty → the Manager's initial session (preserves
-// pre-multi-session caller behavior — runtime layer maps the zero
-// SessionId to m.sessionID via its Prompt/Cancel/SetModel shims).
+// typed acp.SessionId. Empty → resolved to the Manager's initial session
+// inside PromptSession / CancelSession / SetModelSession themselves. This
+// keeps the empty-string-means-initial convention in exactly one layer
+// (the runtime) rather than duplicating it across client / service / runtime.
 func resolveSessionID(s string) acp.SessionId {
 	return acp.SessionId(s)
 }
@@ -39,16 +40,8 @@ func (s *Service) Prompt(ctx context.Context, req *runapi.SessionPromptParams) (
 	s.trans.NotifyTurnStart()
 	s.trans.NotifyUserPrompt(req.Prompt)
 
-	// Empty SessionID → use initial session (Manager.Prompt is the shim).
-	// Non-empty → route to specific session (PromptSession validates it
-	// exists in the sessions map).
-	var resp acp.PromptResponse
-	var err error
-	if req.SessionID == "" {
-		resp, err = s.mgr.Prompt(ctx, req.Prompt)
-	} else {
-		resp, err = s.mgr.PromptSession(ctx, resolveSessionID(req.SessionID), req.Prompt)
-	}
+	// Empty sessionID is resolved to the initial session inside PromptSession.
+	resp, err := s.mgr.PromptSession(ctx, resolveSessionID(req.SessionID), req.Prompt)
 
 	stopReason := "error"
 	if err == nil {
@@ -66,11 +59,7 @@ func (s *Service) Prompt(ctx context.Context, req *runapi.SessionPromptParams) (
 }
 
 func (s *Service) Cancel(ctx context.Context, req *runapi.SessionCancelParams) (retErr error) {
-	// req may be nil if caller sent no params (pre-multi-session clients).
-	sessionID := ""
-	if req != nil {
-		sessionID = req.SessionID
-	}
+	sessionID := req.SessionID
 	s.logger.Debug("cancel", "sessionId", sessionID)
 	defer func() {
 		var auditArgs map[string]string
@@ -80,13 +69,8 @@ func (s *Service) Cancel(ctx context.Context, req *runapi.SessionCancelParams) (
 		s.trans.NotifyOperationAudit("cancel", auditArgs, retErr)
 	}()
 
-	var err error
-	if sessionID == "" {
-		err = s.mgr.Cancel(ctx)
-	} else {
-		err = s.mgr.CancelSession(ctx, resolveSessionID(sessionID))
-	}
-	if err != nil {
+	// Empty sessionID is resolved to the initial session inside CancelSession.
+	if err := s.mgr.CancelSession(ctx, resolveSessionID(sessionID)); err != nil {
 		retErr = jsonrpc.ErrInternal(err.Error())
 		return retErr
 	}
@@ -261,13 +245,8 @@ func (s *Service) SetModel(ctx context.Context, req *runapi.SessionSetModelParam
 		retErr = jsonrpc.ErrInvalidParams("missing modelId")
 		return nil, retErr
 	}
-	var err error
-	if req.SessionID == "" {
-		err = s.mgr.SetModel(ctx, req.ModelID)
-	} else {
-		err = s.mgr.SetModelSession(ctx, resolveSessionID(req.SessionID), req.ModelID)
-	}
-	if err != nil {
+	// Empty sessionID is resolved to the initial session inside SetModelSession.
+	if err := s.mgr.SetModelSession(ctx, resolveSessionID(req.SessionID), req.ModelID); err != nil {
 		retErr = jsonrpc.ErrInternal(err.Error())
 		return nil, retErr
 	}

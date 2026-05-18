@@ -149,3 +149,76 @@ func TestCancelSession_RejectsBeforeAgentStarted(t *testing.T) {
 		t.Fatalf("expected 'agent not started' error, got: %v", err)
 	}
 }
+
+// TestEndSession_RefusesBusySession verifies that EndSession returns a
+// busy error when a session has in-flight Prompt work (refcount > 0).
+// Without this check, ending a session mid-prompt leaves the prompt
+// running against a session no longer in the map — state.json bookkeeping
+// drifts silently.
+func TestEndSession_RefusesBusySession(t *testing.T) {
+	m := newManagerForSessionTest(t)
+	m.sessionID = "initial"
+	m.sessions["initial"] = &sessionState{id: "initial"}
+	m.sessions["busy"] = &sessionState{id: "busy", cwd: "/b", inflight: 1}
+
+	err := m.EndSession("busy")
+	if err == nil {
+		t.Fatalf("expected EndSession to refuse a busy session")
+	}
+	if !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("expected error to mention 'busy', got: %v", err)
+	}
+	if _, ok := m.sessions["busy"]; !ok {
+		t.Fatalf("busy session removed despite error")
+	}
+}
+
+// TestEndSession_AllowsAfterRefcountClears verifies that a session can
+// be ended once its in-flight refcount drops back to zero — the busy
+// check is per-state, not permanent.
+func TestEndSession_AllowsAfterRefcountClears(t *testing.T) {
+	m := newManagerForSessionTest(t)
+	m.sessionID = "initial"
+	m.sessions["initial"] = &sessionState{id: "initial"}
+	m.sessions["s"] = &sessionState{id: "s", cwd: "/s", inflight: 1}
+
+	if err := m.EndSession("s"); err == nil {
+		t.Fatalf("expected busy error first")
+	}
+
+	m.sessions["s"].inflight = 0 // prompt completed
+
+	if err := m.EndSession("s"); err != nil {
+		t.Fatalf("expected EndSession to succeed after refcount cleared: %v", err)
+	}
+	if _, ok := m.sessions["s"]; ok {
+		t.Fatalf("session not removed after EndSession")
+	}
+}
+
+// TestPromptSession_EmptySessionIDResolvesToInitial verifies the
+// single-resolution-point convention: an empty sessionID is resolved to
+// m.sessionID inside PromptSession (rather than at the Service or
+// Manager.Prompt-shim layer). Reaching the "session not found" branch
+// would mean the empty-string convention leaked through unresolved.
+func TestPromptSession_EmptySessionIDResolvesToInitial(t *testing.T) {
+	m := newManagerForSessionTest(t)
+	m.sessionID = "initial"
+	m.sessions["initial"] = &sessionState{id: "initial"}
+
+	// nil conn so we get "agent not started" instead of nil-deref —
+	// the point is to confirm we got past the session-lookup step,
+	// which would have returned "session %q not found" for the literal
+	// empty string had resolution not happened.
+	_, err := m.PromptSession(context.Background(), "",
+		[]acp.ContentBlock{acp.TextBlock("hi")})
+	if err == nil {
+		t.Fatalf("expected error (agent not started)")
+	}
+	if strings.Contains(err.Error(), "not found") {
+		t.Fatalf("empty sessionID was not resolved to initial; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "agent not started") {
+		t.Fatalf("expected 'agent not started', got: %v", err)
+	}
+}
