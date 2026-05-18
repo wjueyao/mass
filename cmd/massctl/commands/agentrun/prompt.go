@@ -17,9 +17,10 @@ import (
 
 func newPromptCmd(getClient cliutil.ClientFn) *cobra.Command {
 	var (
-		ws   string
-		text string
-		wait bool
+		ws        string
+		text      string
+		wait      bool
+		sessionID string
 	)
 	cmd := &cobra.Command{
 		Use:   "prompt name",
@@ -37,7 +38,9 @@ func newPromptCmd(getClient cliutil.ClientFn) *cobra.Command {
 			key := pkgariapi.ObjectKey{Workspace: ws, Name: name}
 
 			if !wait {
-				result, err := client.AgentRuns().Prompt(ctx, key, []runapi.ContentBlock{runapi.TextBlock(text)})
+				// PromptSession with empty sessionID == Prompt — single entry point.
+				result, err := client.AgentRuns().PromptSession(ctx, key, sessionID,
+					[]runapi.ContentBlock{runapi.TextBlock(text)})
 				if err != nil {
 					return err
 				}
@@ -75,7 +78,8 @@ func newPromptCmd(getClient cliutil.ClientFn) *cobra.Command {
 
 			// Send prompt (fire-and-forget).
 			if err := runClient.SendPrompt(ctx, &runapi.SessionPromptParams{
-				Prompt: []runapi.ContentBlock{runapi.TextBlock(text)},
+				SessionID: sessionID,
+				Prompt:    []runapi.ContentBlock{runapi.TextBlock(text)},
 			}); err != nil {
 				return fmt.Errorf("send_prompt: %w", err)
 			}
@@ -109,6 +113,8 @@ func newPromptCmd(getClient cliutil.ClientFn) *cobra.Command {
 	cmd.Flags().StringVarP(&ws, "workspace", "w", "", "Workspace name (required)")
 	cmd.Flags().StringVar(&text, "text", "", "Prompt text (required)")
 	cmd.Flags().BoolVar(&wait, "wait", false, "Wait for turn to complete and print agent response")
+	cmd.Flags().StringVar(&sessionID, "session-id", "",
+		"Session id to prompt (defaults to the agent's initial session). Use new-session to open one.")
 	_ = cmd.MarkFlagRequired("workspace")
 	_ = cmd.MarkFlagRequired("text")
 	return cmd
