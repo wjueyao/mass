@@ -287,3 +287,46 @@ func TestClearSessions(t *testing.T) {
 		t.Errorf("conn not cleared: %v", m.conn)
 	}
 }
+
+// TestDecrementPromptInflight_GuardsAgainstNegativeAfterClear pins the
+// guard against a PromptSession defer racing with Kill: clearSessions
+// resets activePrompts to 0, then the still-in-flight prompt's deferred
+// cleanup runs. Without the > 0 check the counter would slip to -1 and
+// stay there until next clearSessions; with it, the decrement is a
+// no-op and the counter remains coherent.
+func TestDecrementPromptInflight_GuardsAgainstNegativeAfterClear(t *testing.T) {
+	m := newManagerForSessionTest(t)
+	m.sessionID = "initial"
+	m.sessions["initial"] = &sessionState{id: "initial"}
+
+	// Simulate the post-clearSessions state: counters reset, session map
+	// emptied (the in-flight prompt's session is already gone).
+	m.activePrompts = 0
+	delete(m.sessions, "initial")
+
+	// Run the deferred cleanup that PromptSession would have queued.
+	m.decrementPromptInflight("initial")
+
+	if m.activePrompts != 0 {
+		t.Errorf("activePrompts should stay at 0 after racing clearSessions, got %d", m.activePrompts)
+	}
+}
+
+// TestDecrementPromptInflight_NormalPath verifies that the happy-path
+// decrement (no race) still works — sess.inflight and m.activePrompts
+// both go down by one.
+func TestDecrementPromptInflight_NormalPath(t *testing.T) {
+	m := newManagerForSessionTest(t)
+	m.sessionID = "initial"
+	m.sessions["initial"] = &sessionState{id: "initial", inflight: 1}
+	m.activePrompts = 1
+
+	m.decrementPromptInflight("initial")
+
+	if got := m.sessions["initial"].inflight; got != 0 {
+		t.Errorf("session inflight should be 0, got %d", got)
+	}
+	if m.activePrompts != 0 {
+		t.Errorf("activePrompts should be 0, got %d", m.activePrompts)
+	}
+}

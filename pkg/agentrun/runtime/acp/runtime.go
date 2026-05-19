@@ -468,6 +468,23 @@ func (m *Manager) resolveSessionLocked(sessionID acp.SessionId) acp.SessionId {
 	return sessionID
 }
 
+// decrementPromptInflight is the deferred cleanup for PromptSession. The
+// session may have been deleted by Kill/clearSessions in the window between
+// PromptSession's entry and conn.Prompt returning; both decrements guard
+// for that — sess.inflight only if the session still exists, and
+// activePrompts only when positive so a racing clearSessions (which sets
+// activePrompts to 0) doesn't drive the counter negative.
+func (m *Manager) decrementPromptInflight(sessionID acp.SessionId) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.sessions[sessionID]; ok {
+		s.inflight--
+	}
+	if m.activePrompts > 0 {
+		m.activePrompts--
+	}
+}
+
 // SessionIDs returns a snapshot of currently-active session IDs. Order is
 // not stable — caller should sort if a deterministic order is needed.
 func (m *Manager) SessionIDs() []acp.SessionId {
@@ -516,15 +533,7 @@ func (m *Manager) PromptSession(ctx context.Context, sessionID acp.SessionId, pr
 	m.activePrompts++
 	m.mu.Unlock()
 
-	defer func() {
-		m.mu.Lock()
-		// sess may have been deleted by Kill/Delete; guard the deref.
-		if s, ok := m.sessions[sessionID]; ok {
-			s.inflight--
-		}
-		m.activePrompts--
-		m.mu.Unlock()
-	}()
+	defer m.decrementPromptInflight(sessionID)
 
 	m.logger.Debug("prompt started", "sessionID", sessionID, "blocks", len(prompt))
 
