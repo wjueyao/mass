@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	acp "github.com/coder/acp-go-sdk"
+
+	apiruntime "github.com/zoumo/mass/pkg/runtime-spec/api"
 )
 
 func TestBuildSeedSystemPrompt_AppendsGuard(t *testing.T) {
@@ -220,5 +222,68 @@ func TestPromptSession_EmptySessionIDResolvesToInitial(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "agent not started") {
 		t.Fatalf("expected 'agent not started', got: %v", err)
+	}
+}
+
+// TestPhaseFromActivePrompts verifies that state.Phase reflects the
+// process-wide activePrompts counter, not a single caller's local view.
+// Before this fix, two concurrent PromptSessions racing on completion
+// could leave Phase=Idle while one was still running.
+func TestPhaseFromActivePrompts(t *testing.T) {
+	m := newManagerForSessionTest(t)
+
+	cases := []struct {
+		name   string
+		active int
+		want   apiruntime.Phase
+	}{
+		{"zero prompts → idle", 0, apiruntime.PhaseIdle},
+		{"one prompt → running", 1, apiruntime.PhaseRunning},
+		{"many prompts → running", 5, apiruntime.PhaseRunning},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m.activePrompts = tc.active
+			var s apiruntime.State
+			m.phaseFromActivePromptsLocked(&s)
+			if s.Phase != tc.want {
+				t.Fatalf("activePrompts=%d: want Phase=%q got %q", tc.active, tc.want, s.Phase)
+			}
+		})
+	}
+}
+
+// TestClearSessions verifies that the bookkeeping reset on agent
+// teardown (Kill / process exit) drops every field that could leave a
+// stale view behind. Without this, Sessions() would return dead IDs and
+// PromptSession would pass its conn != nil guard before failing on the
+// dead pipe.
+func TestClearSessions(t *testing.T) {
+	m := newManagerForSessionTest(t)
+	m.sessionID = "initial"
+	m.sessions["initial"] = &sessionState{id: "initial"}
+	m.sessions["extra"] = &sessionState{id: "extra"}
+	m.activePrompts = 2
+	m.models = &acp.SessionModelState{}
+	// conn is left nil — clearing a nil conn is a no-op, which is the
+	// branch we exercise here. The non-nil-clearing path is exercised
+	// indirectly via Kill()'s integration with a real process.
+
+	m.clearSessions()
+
+	if len(m.sessions) != 0 {
+		t.Errorf("sessions not cleared: %v", m.sessions)
+	}
+	if m.sessionID != "" {
+		t.Errorf("sessionID not cleared: %q", m.sessionID)
+	}
+	if m.activePrompts != 0 {
+		t.Errorf("activePrompts not cleared: %d", m.activePrompts)
+	}
+	if m.models != nil {
+		t.Errorf("models not cleared: %v", m.models)
+	}
+	if m.conn != nil {
+		t.Errorf("conn not cleared: %v", m.conn)
 	}
 }

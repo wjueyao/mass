@@ -94,6 +94,13 @@ type Manager struct {
 	// inflight prompt count lives on each sessionState — see EndSession.
 	sessions map[acp.SessionId]*sessionState
 
+	// activePrompts is the total number of in-flight PromptSession calls
+	// across all sessions. state.json's Phase field is process-wide, so
+	// it must reflect "any session running" — not "the last prompt that
+	// finished". PromptSession bumps this; the deferred decrement +
+	// writeState then re-reads it under m.mu to decide Running vs Idle.
+	activePrompts int
+
 	// sessionID retains the *first* session created by Create() so legacy
 	// callers of Prompt/Cancel/SetModel (which don't pass sessionId) keep
 	// working without code changes. New callers should use the explicit
@@ -270,6 +277,7 @@ func (m *Manager) Create(ctx context.Context) error {
 		defer close(processDone)
 		_ = cmd.Wait()
 		m.logger.Info("process exited")
+		m.clearSessions()
 		_ = m.writeState(func(s *apiruntime.State) {
 			s.MassVersion = m.cfg.MassVersion
 			s.ID = m.cfg.Metadata.Name
@@ -325,6 +333,7 @@ func (m *Manager) Kill(ctx context.Context) error {
 		}
 	}
 
+	m.clearSessions()
 	return m.writeState(func(s *apiruntime.State) {
 		s.MassVersion = m.cfg.MassVersion
 		s.ID = m.cfg.Metadata.Name
@@ -332,6 +341,25 @@ func (m *Manager) Kill(ctx context.Context) error {
 		s.Bundle = m.bundleDir
 		s.Annotations = m.cfg.Metadata.Annotations
 	}, "runtime-stop")
+}
+
+// clearSessions resets the multi-session bookkeeping after the agent
+// process has exited (via Kill or natural exit). Without this, Sessions()
+// returns stale IDs, EndSession silently succeeds on a dead session, and
+// PromptSession passes its conn != nil check before failing on the dead
+// pipe — invariants of the session map are broken across the teardown.
+//
+// In-flight RPCs hold their own captured conn pointer (read under m.mu at
+// entry, used without lock); nil-ing m.conn here only guards *future*
+// calls. Existing goroutines will fail on the closed pipe, which is fine.
+func (m *Manager) clearSessions() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessions = map[acp.SessionId]*sessionState{}
+	m.conn = nil
+	m.sessionID = ""
+	m.models = nil
+	m.activePrompts = 0
 }
 
 // Delete removes the agent state directory. The agent must be stopped first.
@@ -491,6 +519,7 @@ func (m *Manager) PromptSession(ctx context.Context, sessionID acp.SessionId, pr
 		return acp.PromptResponse{}, fmt.Errorf("runtime: prompt: session %q not found", sessionID)
 	}
 	sess.inflight++
+	m.activePrompts++
 	m.mu.Unlock()
 
 	defer func() {
@@ -499,14 +528,13 @@ func (m *Manager) PromptSession(ctx context.Context, sessionID acp.SessionId, pr
 		if s, ok := m.sessions[sessionID]; ok {
 			s.inflight--
 		}
+		m.activePrompts--
 		m.mu.Unlock()
 	}()
 
 	m.logger.Debug("prompt started", "sessionID", sessionID, "blocks", len(prompt))
 
-	_ = m.writeState(func(s *apiruntime.State) {
-		s.Phase = apiruntime.PhaseRunning
-	}, "prompt-started")
+	_ = m.writeState(m.phaseFromActivePromptsLocked, "prompt-started")
 
 	resp, err := conn.Prompt(ctx, acp.PromptRequest{
 		SessionId: sessionID,
@@ -519,15 +547,25 @@ func (m *Manager) PromptSession(ctx context.Context, sessionID acp.SessionId, pr
 			reason = "prompt-failed"
 		}
 		m.logger.Debug("prompt done", "sessionID", sessionID, "reason", reason)
-		_ = m.writeState(func(s *apiruntime.State) {
-			s.Phase = apiruntime.PhaseIdle
-		}, reason)
+		_ = m.writeState(m.phaseFromActivePromptsLocked, reason)
 	}
 
 	if err != nil {
 		return acp.PromptResponse{}, fmt.Errorf("runtime: prompt: %w", err)
 	}
 	return resp, nil
+}
+
+// phaseFromActivePromptsLocked sets state.Phase based on the current
+// activePrompts counter. Used as the writeState apply callback for prompt
+// start/end so Phase reflects "any session running" rather than the last
+// caller's local view. Runs under m.mu (writeState locks before calling).
+func (m *Manager) phaseFromActivePromptsLocked(s *apiruntime.State) {
+	if m.activePrompts > 0 {
+		s.Phase = apiruntime.PhaseRunning
+	} else {
+		s.Phase = apiruntime.PhaseIdle
+	}
 }
 
 // Cancel is a backward-compat shim — equivalent to CancelSession(ctx, "").
