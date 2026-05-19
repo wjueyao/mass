@@ -37,10 +37,11 @@ func (s *Service) Prompt(ctx context.Context, req *runapi.SessionPromptParams) (
 		return nil, jsonrpc.ErrInvalidParams("missing prompt")
 	}
 	s.logger.Debug("prompt", "sessionId", req.SessionID, "blocks", len(req.Prompt))
-	s.trans.NotifyTurnStart()
-	s.trans.NotifyUserPrompt(req.Prompt)
+	// Empty sessionID is resolved to the initial session inside PromptSession
+	// (and inside Translator's Notify* methods).
+	s.trans.NotifyTurnStart(req.SessionID)
+	s.trans.NotifyUserPrompt(req.SessionID, req.Prompt)
 
-	// Empty sessionID is resolved to the initial session inside PromptSession.
 	resp, err := s.mgr.PromptSession(ctx, resolveSessionID(req.SessionID), req.Prompt)
 
 	stopReason := "error"
@@ -50,7 +51,7 @@ func (s *Service) Prompt(ctx context.Context, req *runapi.SessionPromptParams) (
 	if err != nil {
 		s.trans.NotifyError(err.Error())
 	}
-	s.trans.NotifyTurnEnd(acp.StopReason(stopReason))
+	s.trans.NotifyTurnEnd(req.SessionID, acp.StopReason(stopReason))
 	s.logger.Debug("prompt done", "sessionId", req.SessionID, "stopReason", stopReason)
 	if err != nil {
 		return nil, jsonrpc.ErrInternal(err.Error())
@@ -316,7 +317,7 @@ func (s *Service) EndSession(_ context.Context, req *runapi.SessionEndParams) (_
 
 // ListSessions returns the active session IDs snapshot from the Manager.
 func (s *Service) ListSessions(_ context.Context) (*runapi.SessionListResult, error) {
-	ids := s.mgr.Sessions()
+	ids := s.mgr.SessionIDs()
 	out := make([]string, len(ids))
 	for i, id := range ids {
 		out[i] = string(id)

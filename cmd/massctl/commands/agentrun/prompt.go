@@ -85,6 +85,13 @@ func newPromptCmd(getClient cliutil.ClientFn) *cobra.Command {
 			}
 
 			// Collect agent_message text until turn_end.
+			//
+			// When --session-id is set, filter events to that session — without
+			// this, two concurrent sessions on the same agent will cross-talk
+			// (agent_message from session B counted as session A's, turn_end
+			// from B exits early). When sessionID is empty (single-session
+			// legacy default), every event is accepted; Translator stamps
+			// initial-session events with the initial session id.
 			var parts []string
 			timeout := time.After(5 * time.Minute)
 			for {
@@ -92,6 +99,9 @@ func newPromptCmd(getClient cliutil.ClientFn) *cobra.Command {
 				case ev, ok := <-watcher.ResultChan():
 					if !ok {
 						return fmt.Errorf("event stream closed before turn_end")
+					}
+					if sessionID != "" && ev.SessionID != sessionID {
+						continue
 					}
 					if ev.Type == runapi.EventTypeTurnEnd {
 						fmt.Fprintln(cmd.OutOrStdout(), strings.Join(parts, ""))
