@@ -563,7 +563,15 @@ func (m *Manager) PromptSession(ctx context.Context, sessionID acp.SessionId, pr
 // activePrompts counter. Used as the writeState apply callback for prompt
 // start/end so Phase reflects "any session running" rather than the last
 // caller's local view. Runs under m.mu (writeState locks before calling).
+//
+// Skips the write when m.conn is nil — Kill / clearSessions has taken
+// ownership of lifecycle phase (Stopped), and a late-firing PromptSession
+// writeState (from a prompt that was in flight when Kill ran) must not
+// clobber that with Idle / Running.
 func (m *Manager) phaseFromActivePromptsLocked(s *apiruntime.State) {
+	if m.conn == nil {
+		return
+	}
 	if m.activePrompts > 0 {
 		s.Phase = apiruntime.PhaseRunning
 	} else {

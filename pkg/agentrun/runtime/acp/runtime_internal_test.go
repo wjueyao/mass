@@ -231,6 +231,10 @@ func TestPromptSession_EmptySessionIDResolvesToInitial(t *testing.T) {
 // could leave Phase=Idle while one was still running.
 func TestPhaseFromActivePrompts(t *testing.T) {
 	m := newManagerForSessionTest(t)
+	// Non-nil conn means the agent is alive — phaseFromActivePromptsLocked
+	// only writes Phase when m.conn != nil (it cedes lifecycle to Kill
+	// otherwise; see TestPhaseFromActivePromptsLocked_SkipsAfterKill).
+	m.conn = &acp.ClientSideConnection{}
 
 	cases := []struct {
 		name   string
@@ -250,6 +254,25 @@ func TestPhaseFromActivePrompts(t *testing.T) {
 				t.Fatalf("activePrompts=%d: want Phase=%q got %q", tc.active, tc.want, s.Phase)
 			}
 		})
+	}
+}
+
+// TestPhaseFromActivePromptsLocked_SkipsAfterKill verifies that the apply
+// callback leaves state.Phase untouched when m.conn is nil. This is the
+// post-Kill state — Kill / clearSessions owns lifecycle phase (Stopped),
+// and a late-firing PromptSession writeState (from a prompt that was in
+// flight when Kill ran and finally errored on the dead pipe) must NOT
+// clobber Stopped with Idle/Running.
+func TestPhaseFromActivePromptsLocked_SkipsAfterKill(t *testing.T) {
+	m := newManagerForSessionTest(t)
+	m.conn = nil      // post-Kill: clearSessions nilled the conn
+	m.activePrompts = 1 // would normally cause apply to write Running
+
+	s := apiruntime.State{Phase: apiruntime.PhaseStopped}
+	m.phaseFromActivePromptsLocked(&s)
+
+	if s.Phase != apiruntime.PhaseStopped {
+		t.Fatalf("Phase should remain Stopped after Kill, got %q", s.Phase)
 	}
 }
 
