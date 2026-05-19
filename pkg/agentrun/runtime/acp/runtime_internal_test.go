@@ -44,20 +44,20 @@ func newManagerForSessionTest(t *testing.T) *Manager {
 	}
 }
 
-func TestSessions_EmptyWhenNoneRegistered(t *testing.T) {
+func TestSessionIDs_EmptyWhenNoneRegistered(t *testing.T) {
 	m := newManagerForSessionTest(t)
-	if got := m.Sessions(); len(got) != 0 {
+	if got := m.SessionIDs(); len(got) != 0 {
 		t.Fatalf("expected empty sessions, got %v", got)
 	}
 }
 
-func TestSessions_SnapshotIncludesRegistered(t *testing.T) {
+func TestSessionIDs_SnapshotIncludesRegistered(t *testing.T) {
 	m := newManagerForSessionTest(t)
 	m.sessions["sess-a"] = &sessionState{id: "sess-a", cwd: "/a"}
 	m.sessions["sess-b"] = &sessionState{id: "sess-b", cwd: "/b"}
 	m.sessionID = "sess-a"
 
-	got := m.Sessions()
+	got := m.SessionIDs()
 	if len(got) != 2 {
 		t.Fatalf("expected 2 sessions, got %v", got)
 	}

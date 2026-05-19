@@ -63,10 +63,8 @@ type StateChangeHook func(StateChange)
 // agent process (e.g. claude-agent-acp) keeps sessions in a map keyed by
 // sessionId; this struct mirrors the runtime-side view of each.
 //
-// Multi-session lets callers (mass daemon / mindpowers) keep a long-lived
-// agent process and switch session per task, instead of fork+kill an
-// agent process per task. See docs/design/multi-session-per-agentrun.md
-// (TODO: add design doc) for the broader rationale.
+// Multi-session lets callers keep a long-lived agent process and switch
+// session per task, instead of fork+kill an agent process per task.
 type sessionState struct {
 	id     acp.SessionId
 	models *acp.SessionModelState
@@ -384,28 +382,24 @@ func (m *Manager) GetState() (apiruntime.State, error) {
 // session). Returns the new session's ID, which callers must pass to
 // PromptSession / CancelSession / EndSession to address this session.
 //
-// cwd overrides the agent's working directory for this session — useful for
-// running multiple isolated tasks on one long-lived agent (e.g. self-EDD's
-// per-case fixture directories). Empty cwd uses the agent's workDir.
+// cwd is required — each session is scoped to its own working directory.
+// All wire-level callers (Service / ARI / CLI) already reject empty cwd;
+// the runtime validates here too for in-process callers and so the
+// contract is consistent across layers.
 //
 // mcpServers (optional) are extra MCP servers scoped to this session, layered
 // on top of the agent's bundle-level mcpServers.
 func (m *Manager) NewSession(ctx context.Context, cwd string, mcpServers []acp.McpServer) (acp.SessionId, error) {
+	if cwd == "" {
+		return "", fmt.Errorf("runtime: new session: cwd is required")
+	}
+
 	m.mu.Lock()
 	conn := m.conn
 	m.mu.Unlock()
 
 	if conn == nil {
 		return "", fmt.Errorf("runtime: agent not started")
-	}
-
-	resolvedCwd := cwd
-	if resolvedCwd == "" {
-		workDir, err := spec.ResolveAgentRoot(m.bundleDir, m.cfg)
-		if err != nil {
-			return "", fmt.Errorf("runtime: resolve cwd for new session: %w", err)
-		}
-		resolvedCwd = workDir
 	}
 
 	// Layer session-scoped mcpServers on top of bundle-level config. Callers
@@ -415,7 +409,7 @@ func (m *Manager) NewSession(ctx context.Context, cwd string, mcpServers []acp.M
 
 	req := acp.NewSessionRequest{
 		Meta:       m.cfg.Session.Meta,
-		Cwd:        resolvedCwd,
+		Cwd:        cwd,
 		McpServers: merged,
 	}
 	resp, err := conn.NewSession(ctx, req)
@@ -427,10 +421,10 @@ func (m *Manager) NewSession(ctx context.Context, cwd string, mcpServers []acp.M
 	m.sessions[resp.SessionId] = &sessionState{
 		id:     resp.SessionId,
 		models: resp.Models,
-		cwd:    resolvedCwd,
+		cwd:    cwd,
 	}
 	m.mu.Unlock()
-	m.logger.Info("session opened", "sessionID", resp.SessionId, "cwd", resolvedCwd)
+	m.logger.Info("session opened", "sessionID", resp.SessionId, "cwd", cwd)
 	return resp.SessionId, nil
 }
 
@@ -474,9 +468,9 @@ func (m *Manager) resolveSessionLocked(sessionID acp.SessionId) acp.SessionId {
 	return sessionID
 }
 
-// Sessions returns a snapshot of currently-active session IDs. Order is
+// SessionIDs returns a snapshot of currently-active session IDs. Order is
 // not stable — caller should sort if a deterministic order is needed.
-func (m *Manager) Sessions() []acp.SessionId {
+func (m *Manager) SessionIDs() []acp.SessionId {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ids := make([]acp.SessionId, 0, len(m.sessions))
@@ -610,7 +604,7 @@ func (m *Manager) SetModelSession(ctx context.Context, sessionID acp.SessionId, 
 	m.mu.Lock()
 	conn := m.conn
 	sessionID = m.resolveSessionLocked(sessionID)
-	sess, known := m.sessions[sessionID]
+	_, known := m.sessions[sessionID]
 	initialID := m.sessionID
 	m.mu.Unlock()
 
@@ -630,9 +624,12 @@ func (m *Manager) SetModelSession(ctx context.Context, sessionID acp.SessionId, 
 		return fmt.Errorf("runtime: set model: %w", err)
 	}
 
-	// Update per-session in-memory models state.
+	// Re-lookup under the second lock — the session could have been ended
+	// (or the whole map cleared by teardown) between the first unlock and
+	// here, in which case the in-memory model mutation should silently no-op
+	// rather than write through an orphan struct.
 	m.mu.Lock()
-	if sess.models != nil {
+	if sess, ok := m.sessions[sessionID]; ok && sess.models != nil {
 		sess.models.CurrentModelId = acp.ModelId(modelID) //nolint:gosec // ModelId is string
 	}
 	// Legacy single-session models mirror for the initial session only.
