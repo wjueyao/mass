@@ -32,11 +32,12 @@ const (
 	// Multi-session lifecycle for a single agentrun. session/new opens
 	// an additional ACP session (different cwd, fresh state) without
 	// fork+exec a new agent process; session/end releases runtime
-	// tracking; session/list enumerates active sessions. See
+	// tracking; session/list enumerates active sessions. Names parallel
+	// agentrun/task/* — one resource/verb hierarchy at this layer. See
 	// pkg/agentrun/runtime/acp Manager.NewSession for runtime contract.
-	MethodAgentRunNewSession   = "agentrun/new-session"
-	MethodAgentRunEndSession   = "agentrun/end-session"
-	MethodAgentRunListSessions = "agentrun/list-sessions"
+	MethodAgentRunNewSession   = "agentrun/session/new"
+	MethodAgentRunEndSession   = "agentrun/session/end"
+	MethodAgentRunListSessions = "agentrun/session/list"
 )
 
 // ARI agent definition methods.

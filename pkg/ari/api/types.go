@@ -89,7 +89,7 @@ type AgentRunPromptParams struct {
 	// Name is the agent run name (required).
 	Name string `json:"name"`
 
-	// SessionID addresses a specific session opened via agentrun/new-session.
+	// SessionID addresses a specific session opened via agentrun/session/new.
 	// Empty (omitted) routes to the agentrun's initial session — preserves
 	// pre-multi-session caller behavior.
 	SessionID string `json:"sessionId,omitempty"`
@@ -104,7 +104,7 @@ type AgentRunPromptResult struct {
 	Accepted bool `json:"accepted"`
 }
 
-// AgentRunNewSessionParams is the request params for agentrun/new-session.
+// AgentRunNewSessionParams is the request params for agentrun/session/new.
 // Opens an additional ACP session on an existing agentrun (no fork+exec).
 type AgentRunNewSessionParams struct {
 	Workspace string `json:"workspace"`
@@ -116,21 +116,21 @@ type AgentRunNewSessionParams struct {
 	McpServers []runapi.SessionNewMcpServer `json:"mcpServers,omitempty"`
 }
 
-// AgentRunNewSessionResult is the response for agentrun/new-session.
+// AgentRunNewSessionResult is the response for agentrun/session/new.
 type AgentRunNewSessionResult struct {
 	// SessionID is the ACP session id the caller passes to subsequent
 	// agentrun/prompt (etc.) via the SessionID field.
 	SessionID string `json:"sessionId"`
 }
 
-// AgentRunEndSessionParams is the request params for agentrun/end-session.
+// AgentRunEndSessionParams is the request params for agentrun/session/end.
 type AgentRunEndSessionParams struct {
 	Workspace string `json:"workspace"`
 	Name      string `json:"name"`
 	SessionID string `json:"sessionId"`
 }
 
-// AgentRunEndSessionResult is the response for agentrun/end-session.
+// AgentRunEndSessionResult is the response for agentrun/session/end.
 type AgentRunEndSessionResult struct{}
 
 // AgentRunListSessionsParams identifies the agentrun whose sessions to list.

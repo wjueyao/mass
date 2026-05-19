@@ -530,14 +530,22 @@ func (a *agentRunAdapter) Prompt(ctx context.Context, req *pkgariapi.AgentRunPro
 	return &pkgariapi.AgentRunPromptResult{Accepted: true}, nil
 }
 
-// NewSession forwards agentrun/new-session to the running agent-run's
+// NewSession forwards agentrun/session/new to the running agent-run's
 // session/new RPC. The agent reuses its process to host the new session
 // — no fork+exec. Returns the agent-issued sessionId.
+//
+// Rejects requests while the daemon is recovering agents — sessions opened
+// then would race with recovery's view of the agent process. Doesn't use
+// reserveIdleAgent because multi-session permits opening a session while
+// another is mid-prompt (Status=Running); only recovery is unsafe.
 func (a *agentRunAdapter) NewSession(ctx context.Context, req *pkgariapi.AgentRunNewSessionParams) (*pkgariapi.AgentRunNewSessionResult, error) {
 	if req.Workspace == "" || req.Name == "" || req.Cwd == "" {
 		return nil, jsonrpc.ErrInvalidParams("workspace, name, and cwd are required")
 	}
-	a.logger.Info("agentrun/new-session", "workspace", req.Workspace, "name", req.Name, "cwd", req.Cwd)
+	if err := a.rejectIfRecovering(); err != nil {
+		return nil, err
+	}
+	a.logger.Info("agentrun/session/new", "workspace", req.Workspace, "name", req.Name, "cwd", req.Cwd)
 
 	client, err := a.processes.Connect(ctx, req.Workspace, req.Name)
 	if err != nil {
@@ -551,17 +559,20 @@ func (a *agentRunAdapter) NewSession(ctx context.Context, req *pkgariapi.AgentRu
 	if err != nil {
 		return nil, jsonrpc.ErrInternal(err.Error())
 	}
-	a.logger.Info("agentrun/new-session: opened",
+	a.logger.Info("agentrun/session/new: opened",
 		"workspace", req.Workspace, "name", req.Name, "sessionId", out.SessionID)
 	return &pkgariapi.AgentRunNewSessionResult{SessionID: out.SessionID}, nil
 }
 
-// EndSession forwards agentrun/end-session to release runtime tracking.
+// EndSession forwards agentrun/session/end to release runtime tracking.
 func (a *agentRunAdapter) EndSession(ctx context.Context, req *pkgariapi.AgentRunEndSessionParams) (*pkgariapi.AgentRunEndSessionResult, error) {
 	if req.Workspace == "" || req.Name == "" || req.SessionID == "" {
 		return nil, jsonrpc.ErrInvalidParams("workspace, name, and sessionId are required")
 	}
-	a.logger.Info("agentrun/end-session", "workspace", req.Workspace, "name", req.Name, "sessionId", req.SessionID)
+	if err := a.rejectIfRecovering(); err != nil {
+		return nil, err
+	}
+	a.logger.Info("agentrun/session/end", "workspace", req.Workspace, "name", req.Name, "sessionId", req.SessionID)
 
 	client, err := a.processes.Connect(ctx, req.Workspace, req.Name)
 	if err != nil {
@@ -573,10 +584,13 @@ func (a *agentRunAdapter) EndSession(ctx context.Context, req *pkgariapi.AgentRu
 	return &pkgariapi.AgentRunEndSessionResult{}, nil
 }
 
-// ListSessions forwards agentrun/list-sessions to enumerate active sessions.
+// ListSessions forwards agentrun/session/list to enumerate active sessions.
 func (a *agentRunAdapter) ListSessions(ctx context.Context, req *pkgariapi.AgentRunListSessionsParams) (*pkgariapi.AgentRunListSessionsResult, error) {
 	if req.Workspace == "" || req.Name == "" {
 		return nil, jsonrpc.ErrInvalidParams("workspace and name are required")
+	}
+	if err := a.rejectIfRecovering(); err != nil {
+		return nil, err
 	}
 
 	client, err := a.processes.Connect(ctx, req.Workspace, req.Name)
@@ -588,6 +602,17 @@ func (a *agentRunAdapter) ListSessions(ctx context.Context, req *pkgariapi.Agent
 		return nil, jsonrpc.ErrInternal(err.Error())
 	}
 	return &pkgariapi.AgentRunListSessionsResult{SessionIDs: out.SessionIDs}, nil
+}
+
+// rejectIfRecovering returns CodeRecoveryBlocked when the daemon is mid-
+// recovery. Used by session-lifecycle handlers that can't go through
+// reserveIdleAgent (multi-session allows operations while another session
+// is Running) but still must serialize against the recovery sweep.
+func (a *agentRunAdapter) rejectIfRecovering() *jsonrpc.RPCError {
+	if a.processes.IsRecovering() {
+		return &jsonrpc.RPCError{Code: pkgariapi.CodeRecoveryBlocked, Message: "daemon is recovering agents"}
+	}
+	return nil
 }
 
 // Cancel handles agentrun/cancel.

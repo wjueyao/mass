@@ -162,11 +162,12 @@ func RegisterAgentRunService(s *jsonrpc.Server, svc AgentRunService) {
 			"task/get":   jsonrpc.UnaryMethod(svc.TaskGet),
 			"task/list":  jsonrpc.UnaryMethod(svc.TaskList),
 			"task/retry": jsonrpc.UnaryMethod(svc.TaskRetry),
-			// Multi-session lifecycle (see pkg/agentrun/runtime/acp
-			// Manager.NewSession for runtime contract).
-			"new-session":   jsonrpc.UnaryMethod(svc.NewSession),
-			"end-session":   jsonrpc.UnaryMethod(svc.EndSession),
-			"list-sessions": jsonrpc.UnaryMethod(svc.ListSessions),
+			// Multi-session lifecycle. Names parallel agentrun/task/* —
+			// agentrun/session/new / end / list — so a third-party reader
+			// sees one consistent resource/verb hierarchy at this layer.
+			"session/new":  jsonrpc.UnaryMethod(svc.NewSession),
+			"session/end":  jsonrpc.UnaryMethod(svc.EndSession),
+			"session/list": jsonrpc.UnaryMethod(svc.ListSessions),
 		},
 	})
 }
